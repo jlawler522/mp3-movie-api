@@ -1,41 +1,75 @@
-def test_upload_csv(client, sample_csv_bytes):
-    response = client.post(
-        "/upload",
-        files={"file": ("sample_data.csv", sample_csv_bytes, "text/csv")},
-    )
+﻿import pandas as pd
+import pytest
 
+import main
+from src import MovieStorage
+
+MOVIE_COLUMNS = ["title", "release_year", "rating", "genre"]
+
+
+def test_movies_persist(client, test_storage, uploaded_movies):
+    reopened = MovieStorage(test_storage.db_path)
+    df = reopened.get()
+
+    assert reopened.count_movies() == 20
+    assert len(df) == 20
+    assert list(df.columns) == MOVIE_COLUMNS
+
+    expected_titles = pd.read_csv("fixtures/sample_movies.csv")["title"].tolist()
+    assert df["title"].tolist() == expected_titles
+
+    stored_ids = [row["id"] for row in reopened.select_columns(["title"], limit=100)]
+    response = client.get("/movies", params={"limit": 100})
     assert response.status_code == 200
-    body = response.json()
-    assert body["rows"] == 6
-    assert body["columns"] == 2
-    assert isinstance(body["id"], int)
-    assert body["id"] > 0
+    api_ids = [row["id"] for row in response.json()["data"]]
+
+    assert stored_ids == list(range(1, 21))
+    assert api_ids == list(range(1, 21))
 
 
-def test_process_and_retrieve(client, uploaded_dataset_id, processing_body):
-    response = client.post(
-        f"/datasets/{uploaded_dataset_id}/process",
-        json=processing_body,
-    )
+def test_cache_and_processing(client, uploaded_movies, processing_body):
+    first_100 = client.get("/movies", params={"limit": 100})
+    first_1 = client.get("/movies", params={"limit": 1})
+    assert first_100.status_code == 200
+    assert first_1.status_code == 200
+    assert main.cache.get(100) == first_100.json()
+    assert main.cache.get(1) == first_1.json()
 
-    assert response.status_code == 200
-    report = response.json()
-    assert report["validation_rows_removed"] == 1
-    assert report["cleaning_report"]["rows_before"] == 5
-    assert report["cleaning_report"]["rows_after"] == 3
+    repeat_100 = client.get("/movies", params={"limit": 100})
+    assert repeat_100.status_code == 200
+    assert repeat_100.json() == first_100.json()
 
-    response = client.get(f"/datasets/{uploaded_dataset_id}")
+    processed = client.post("/movies/process", json=processing_body)
+    assert processed.status_code == 200
+    report = processed.json()
+    assert report["validation_rows_removed"] == 0
+    assert report["cleaning_report"]["rows_before"] == 20
+    assert report["cleaning_report"]["rows_after"] == 16
+    assert report["cleaning_report"]["rows_removed"] == 4
+    assert main.cache.get(100) is None
+    assert main.cache.get(1) is None
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["total_rows"] == 3
-    student_ids = [row["student_id"] for row in body["data"]]
-    scores = [row["score"] for row in body["data"]]
-    assert student_ids == [1, 2, 5]
-    assert scores == [80, 90, 85]
+    after = client.get("/movies", params={"limit": 100})
+    assert after.status_code == 200
+    body = after.json()
+    assert body["total_rows"] == 16
+    assert [row["title"] for row in body["data"]] == [
+        f"Movie {letter}" for letter in "ABCDEFGHIJKLMNOP"
+    ]
+    assert [row["id"] for row in body["data"]] == list(range(1, 17))
+    assert main.cache.get(100) == body
 
 
-def test_retrieve_missing_dataset(client):
-    response = client.get("/datasets/999")
+def test_cache_hit_skips_database(client, uploaded_movies, monkeypatch):
+    first = client.get("/movies", params={"limit": 100})
+    assert first.status_code == 200
 
-    assert response.status_code == 404
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("Database was queried on a cache hit")
+
+    monkeypatch.setattr(main.storage, "select_columns", fail_if_called)
+    monkeypatch.setattr(main.storage, "count_movies", fail_if_called)
+
+    second = client.get("/movies", params={"limit": 100})
+    assert second.status_code == 200
+    assert second.json() == first.json()
